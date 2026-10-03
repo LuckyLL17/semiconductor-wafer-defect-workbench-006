@@ -17,7 +17,50 @@ app.get('/api/defects',async(req)=>{const q=req.query as {kind?:string;severity?
 app.post('/api/defects/:id/review',async(req)=>{const id=(req.params as {id:string}).id;const body=req.body as {review:'confirmed'|'false_positive';note?:string};const d=defects.find(x=>x.id===id);if(!d)return {error:'defect_not_found'};d.review=body.review;if(body.note)d.note=body.note;audits.unshift({at:new Date().toISOString(),action:'defect_review',defectId:id,review:body.review});return d});
 app.get('/api/analysis/spatial',async()=>({wafer,grid:spatial(),clusters:clusters(),hotspots:clusters().filter(c=>c.maxSeverity!=='low').slice(0,5)}));
 app.get('/api/analysis/process-window',async()=>({runs:processRuns,window:window(),correlations:[{factor:'温度',metric:'缺陷密度',coefficient:-.62,interpretation:'高于 45°C 后颗粒缺陷密度上升'},{factor:'压力',metric:'划痕占比',coefficient:.48,interpretation:'压力波动与线性缺陷存在关联'},{factor:'RF功率',metric:'良率',coefficient:-.71,interpretation:'功率偏高时良率下降'}]}));
-app.get('/api/analysis/compare',async()=>({current:{lot:wafer.lot,defects:defects.length,highRisk:defects.filter(d=>d.severity==='high').length,yield:93.7},baseline:{lot:'LOT-A16',defects:31,highRisk:2,yield:96.1},delta:{defects:17,highRisk:1,yield:-2.4}}));
+type LotHistory={lot:string;layer:string;recipe:string;timestamp:string;defects:number;highRisk:number;yield:number};
+const DEFAULT_BASELINE='LOT-A16';
+const lotHistory:LotHistory[]=[
+ {lot:'LOT-A16',layer:'M2',recipe:'ETCH-M2-V4',timestamp:'2026-09-29T20:10:00Z',defects:31,highRisk:2,yield:96.1},
+ {lot:'LOT-A15',layer:'M2',recipe:'ETCH-M2-V4',timestamp:'2026-09-29T08:05:00Z',defects:34,highRisk:3,yield:95.6},
+ {lot:'LOT-A14',layer:'M2',recipe:'ETCH-M2-V3',timestamp:'2026-09-28T19:40:00Z',defects:38,highRisk:3,yield:95.0},
+ {lot:'LOT-A13',layer:'M2',recipe:'ETCH-M2-V3',timestamp:'2026-09-28T07:22:00Z',defects:29,highRisk:1,yield:96.4},
+ {lot:'LOT-A12',layer:'M2',recipe:'ETCH-M2-V3',timestamp:'2026-09-27T18:55:00Z',defects:36,highRisk:2,yield:95.4},
+ {lot:'LOT-A11',layer:'M2',recipe:'ETCH-M2-V2',timestamp:'2026-09-27T06:30:00Z',defects:41,highRisk:4,yield:94.7},
+ {lot:'LOT-A10',layer:'M2',recipe:'ETCH-M2-V2',timestamp:'2026-09-26T17:12:00Z',defects:33,highRisk:2,yield:95.9},
+ {lot:'LOT-A09',layer:'M2',recipe:'ETCH-M2-V2',timestamp:'2026-09-26T05:48:00Z',defects:37,highRisk:3,yield:95.2},
+ {lot:'LOT-A08',layer:'M2',recipe:'ETCH-M2-V1',timestamp:'2026-09-25T16:05:00Z',defects:44,highRisk:5,yield:94.3},
+ {lot:'LOT-A07',layer:'M2',recipe:'ETCH-M2-V1',timestamp:'2026-09-25T04:40:00Z',defects:35,highRisk:2,yield:95.5},
+ {lot:'LOT-A06',layer:'M2',recipe:'ETCH-M2-V1',timestamp:'2026-09-24T15:18:00Z',defects:39,highRisk:3,yield:94.9},
+ {lot:'LOT-A05',layer:'M1',recipe:'ETCH-M1-V2',timestamp:'2026-09-24T03:02:00Z',defects:27,highRisk:1,yield:96.8},
+ {lot:'LOT-A04',layer:'M2',recipe:'DEP-M2-V1',timestamp:'2026-09-23T14:26:00Z',defects:42,highRisk:4,yield:94.5}
+];
+function currentCompareStats(){return{defects:defects.length,highRisk:defects.filter(d=>d.severity==='high').length,yield:93.7};}
+type BaselineCheck={ok:true;baseline:LotHistory;compatible:true}|{ok:false;error:string;reason:string;compatible:false;lot:string;layer?:string;recipe?:string};
+function checkBaseline(lot:string):BaselineCheck{
+ if(lot===wafer.lot)return{ok:false,error:'baseline_same_as_current',reason:'不能选择当前批次自身作为基线',compatible:false,lot,layer:wafer.layer,recipe:wafer.recipe};
+ const baseline=lotHistory.find(r=>r.lot===lot);
+ if(!baseline)return{ok:false,error:'baseline_lot_not_found',reason:`批次 ${lot} 不存在，无法作为对比基线`,compatible:false,lot};
+ if(baseline.layer!==wafer.layer)return{ok:false,error:'layer_incompatible',reason:`层级不兼容：当前批次为 ${wafer.layer}，${lot} 为 ${baseline.layer}`,compatible:false,lot,layer:baseline.layer,recipe:baseline.recipe};
+ const family=(recipe:string)=>recipe.split('-').slice(0,2).join('-');
+ if(family(baseline.recipe)!==family(wafer.recipe))return{ok:false,error:'process_incompatible',reason:`工艺不兼容：当前批次工艺 ${wafer.recipe}，${lot} 工艺 ${baseline.recipe}，工序族不一致`,compatible:false,lot,layer:baseline.layer,recipe:baseline.recipe};
+ return{ok:true,baseline,compatible:true};
+}
+function comparePayload(baseline:LotHistory){
+ const current={lot:wafer.lot,layer:wafer.layer,recipe:wafer.recipe,...currentCompareStats()};
+ const base={lot:baseline.lot,layer:baseline.layer,recipe:baseline.recipe,...{defects:baseline.defects,highRisk:baseline.highRisk,yield:baseline.yield}};
+ const direction=(n:number)=>n>0?'up':n<0?'down':'flat';
+ const raw={defects:current.defects-baseline.defects,highRisk:current.highRisk-baseline.highRisk,yield:+(current.yield-baseline.yield).toFixed(2)};
+ const delta={defects:raw.defects,highRisk:raw.highRisk,yield:raw.yield,directions:{defects:direction(raw.defects),highRisk:direction(raw.highRisk),yield:direction(raw.yield)}};
+ return{current,baseline:base,defaultBaseline:DEFAULT_BASELINE,delta};
+}
+app.get('/api/lots/baselines',async()=>({current:{lot:wafer.lot,layer:wafer.layer,recipe:wafer.recipe},defaultBaseline:DEFAULT_BASELINE,candidates:lotHistory.map(r=>{const check=checkBaseline(r.lot);return{lot:r.lot,layer:r.layer,recipe:r.recipe,timestamp:r.timestamp,defects:r.defects,highRisk:r.highRisk,yield:r.yield,compatible:check.compatible,...(check.compatible?{}:{error:check.error,reason:check.reason})};})}));
+app.get('/api/analysis/compare',async(req,res)=>{
+ const requested=(req.query as {baseline?:string}).baseline;
+ const lot=requested?.trim()?requested.trim():DEFAULT_BASELINE;
+ const check=checkBaseline(lot);
+ if(!check.ok){res.code(409);return{error:check.error,reason:check.reason,requestedLot:lot,defaultBaseline:DEFAULT_BASELINE,compatible:false};}
+ return comparePayload(check.baseline);
+});
 app.post('/api/actions/hold',async(req)=>{const body=req.body as {lot:string;reason:string};audits.unshift({at:new Date().toISOString(),action:'lot_hold',...body});return {ok:true,lot:body.lot,status:'hold',reason:body.reason}});
 app.get('/api/audit',async()=>audits);
 
